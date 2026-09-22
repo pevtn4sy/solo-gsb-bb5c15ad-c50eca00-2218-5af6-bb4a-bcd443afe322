@@ -3,6 +3,7 @@
 端点：
     POST /paths               写入 SVG path 数据及填充规则
     POST /paths/{id}/normalize 按轮廓包含层级分类外环/孔洞并重写方向
+    POST /paths/compare       两条已存路径的版本差异审计（added/removed/modified）
     GET  /paths/{id}          查询原始路径、规范化结果及边界警告
     GET  /healthz             存活/就绪探针
 """
@@ -17,7 +18,7 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlite3 import Connection
 
-from . import db
+from . import compare, db
 from .svggeo import SVGPathError, normalize_path
 
 
@@ -29,8 +30,9 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="SVG 轮廓规范化 API",
-    version="1.0.0",
-    description="写入 SVG path，按包含层级分类外环/孔洞并重写绕向。",
+    version="1.1.0",
+    description="写入 SVG path，按包含层级分类外环/孔洞并重写绕向；"
+                "支持两条已存路径的轮廓级版本差异审计。",
     lifespan=lifespan,
 )
 
@@ -52,6 +54,13 @@ class PathIn(BaseModel):
     contour_metadata: list[dict[str, Any]] = Field(
         default_factory=list,
         description="按轮廓原始索引提供的自定义元数据，规范化时挂到对应轮廓")
+
+
+class CompareIn(BaseModel):
+    base_id: int = Field(..., gt=0,
+                         description="基线（旧版本）路径 id")
+    candidate_id: int = Field(..., gt=0,
+                              description="候选（新版本）路径 id")
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +126,37 @@ def create_path(payload: PathIn,
             "fill_rule": payload.fill_rule,
             "metadata": payload.metadata,
             "contour_metadata": payload.contour_metadata}
+
+
+@app.post("/paths/compare")
+def compare_paths_endpoint(payload: CompareIn,
+                           conn: Connection = Depends(get_db)
+                           ) -> dict[str, Any]:
+    """两条已存路径的版本差异审计。
+
+    分别规范化 base / candidate 后按几何指纹与原始索引稳定匹配，
+    返回 added / removed / modified；任一路径不存在返回 404，
+    参数缺失/非法或任一路径无法规范化返回 422。
+    """
+    base_row = _get_row(conn, payload.base_id)          # 不存在 -> 404
+    cand_row = _get_row(conn, payload.candidate_id)
+
+    try:
+        result = compare.compare_paths(
+            base_row["d"], base_row["fill_rule"],
+            json.loads(base_row["contour_metadata"] or "[]"),
+            cand_row["d"], cand_row["fill_rule"],
+            json.loads(cand_row["contour_metadata"] or "[]"),
+        )
+    except SVGPathError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"路径规范化失败，无法审计: {exc}")
+
+    return {
+        "base_id": payload.base_id,
+        "candidate_id": payload.candidate_id,
+        **result,
+    }
 
 
 @app.post("/paths/{path_id}/normalize")

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 from dataclasses import dataclass, field
@@ -528,6 +529,7 @@ class Contour:
     depth: int = -1
     parent_original_index: int | None = None
     reversed: bool = False
+    fingerprint: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -565,6 +567,7 @@ def normalize_path(d: str, fill_rule: str,
             bounds=bounds,
             closed=sub["closed"],
             degenerate=degenerate,
+            fingerprint=contour_fingerprint(pts, sub["closed"]),
             metadata=dict(contour_metadata[idx])
             if contour_metadata and idx < len(contour_metadata) else {},
         ))
@@ -687,6 +690,7 @@ def normalize_path(d: str, fill_rule: str,
             "bounds": {"minx": c.bounds[0], "miny": c.bounds[1],
                        "maxx": c.bounds[2], "maxy": c.bounds[3]},
             "reversed": c.reversed,
+            "fingerprint": c.fingerprint,
             "metadata": c.metadata,
         })
 
@@ -720,3 +724,68 @@ def _probe_points(points: list[tuple[float, float]]) -> list[tuple[float, float]
         return list(points) or [(0.0, 0.0)]
     offsets = [0, n // 4, n // 2, (3 * n) // 4]
     return [points[o] for o in offsets]
+
+
+# ---------------------------------------------------------------------------
+# 几何指纹：与绘制方向、闭合环起点、原始索引无关
+# ---------------------------------------------------------------------------
+
+FINGERPRINT_QUANTUM = 1e-9      # 坐标量化步长，吸收浮点/序列化误差
+
+
+def contour_fingerprint(points: list[tuple[float, float]],
+                        closed: bool,
+                        quantum: float = FINGERPRINT_QUANTUM) -> str:
+    """计算轮廓几何指纹。
+
+    - 顶点先量化（吸收浮点噪声）并去除量化后的连续重复点；
+    - 闭合环在所有**循环移位**与**整体反向**中取字典序最小的顶点序列，
+      因此指纹与绘制方向（顺/逆时针）和起点选择无关；
+    - 开放路径不存在循环等价，仅做反向归一化；
+    - 指纹与轮廓在 ``d`` 中的原始索引无关：同一几何轮廓调换子路径顺序后
+      指纹保持不变，供版本差异审计做稳定匹配。
+    """
+    tokens: list[tuple[int, int]] = []
+    for x, y in points:
+        qx, qy = round(x / quantum), round(y / quantum)
+        if tokens and tokens[-1] == (qx, qy):
+            continue  # 量化后连续重复点
+        tokens.append((qx, qy))
+    if len(tokens) > 1 and tokens[0] == tokens[-1]:
+        tokens.pop()
+
+    if closed:
+        canonical = min(_min_rotation(tokens),
+                        _min_rotation(list(reversed(tokens))))
+        kind = "c"
+    else:
+        canonical = min(tokens, list(reversed(tokens)))
+        kind = "o"
+
+    payload = kind + "|" + ";".join(f"{x},{y}" for x, y in canonical)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _min_rotation(seq: list) -> list:
+    """Booth 算法：返回循环序列字典序最小的旋转（线性时间）。"""
+    n = len(seq)
+    if n <= 1:
+        return seq[:]
+    s = seq + seq
+    i, j, k = 0, 1, 0
+    while i < n and j < n and k < n:
+        a, b = s[i + k], s[j + k]
+        if a == b:
+            k += 1
+        elif a < b:
+            i = i + k + 1
+            if i <= j:
+                i = j + 1
+            k = 0
+        else:
+            j = j + k + 1
+            if j <= i:
+                j = i + 1
+            k = 0
+    start = min(i, j)
+    return s[start:start + n]

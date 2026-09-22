@@ -7,6 +7,7 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from app.svggeo import (  # noqa: E402
+    contour_fingerprint,
     flatten_subpath,
     normalize_path,
     parse_path,
@@ -204,3 +205,46 @@ def test_smooth_and_quadratic_parse():
     subs = _subs("M0,0 Q5,10 10,0 T20,0 Z")
     seg_kinds = [s[0] for s in subs[0]["segments"]]
     assert seg_kinds == ["M", "Q", "Q", "Z"]
+
+
+# ---------------------------------------------------------------------------
+# 几何指纹
+# ---------------------------------------------------------------------------
+
+def test_fingerprint_invariant_under_reverse_and_rotation():
+    sub = parse_path("M0,0h40v40h-40Z")[0]
+    rev = reverse_subpath(sub)
+    base_fp = contour_fingerprint(flatten_subpath(sub), True)
+    # 整体反向（方向变化）指纹相同
+    assert contour_fingerprint(flatten_subpath(rev), True) == base_fp
+    # 闭合环从不同顶点起步（索引/起点变化）指纹相同
+    pts = flatten_subpath(sub)
+    rotated = pts[2:] + pts[:2]
+    assert contour_fingerprint(rotated, True) == base_fp
+
+
+def test_fingerprint_detects_geometry_change():
+    a = flatten_subpath(parse_path("M0,0h40v40h-40Z")[0])
+    b = flatten_subpath(parse_path("M0,0h41v40h-41Z")[0])
+    assert contour_fingerprint(a, True) != contour_fingerprint(b, True)
+
+
+def test_fingerprint_open_path_reverse_only():
+    pts = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)]
+    assert contour_fingerprint(pts, False) == \
+        contour_fingerprint(list(reversed(pts)), False)
+
+
+def test_fingerprint_robust_to_serialization_noise():
+    # 量化步长内的浮点抖动不应改变指纹
+    clean = [(0.0, 0.0), (40.0, 0.0), (40.0, 40.0), (0.0, 40.0)]
+    noisy = [(1e-12, -2e-12), (40.0, 0.0),
+             (40.0 + 3e-12, 40.0), (0.0, 40.0)]
+    assert contour_fingerprint(clean, True) == contour_fingerprint(noisy, True)
+
+
+def test_normalized_contours_carry_fingerprint():
+    res = normalize_path("M0,0h40v40h-40Z M10,10h20v20h-20Z", "nonzero")
+    fps = [c["fingerprint"] for c in res["contours"]]
+    assert all(isinstance(fp, str) and len(fp) == 16 for fp in fps)
+    assert fps[0] != fps[1]

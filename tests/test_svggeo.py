@@ -7,6 +7,7 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from app.svggeo import (  # noqa: E402
+    contour_fingerprint,
     flatten_subpath,
     normalize_path,
     parse_path,
@@ -204,3 +205,56 @@ def test_smooth_and_quadratic_parse():
     subs = _subs("M0,0 Q5,10 10,0 T20,0 Z")
     seg_kinds = [s[0] for s in subs[0]["segments"]]
     assert seg_kinds == ["M", "Q", "Q", "Z"]
+
+
+# ---------------------------------------------------------------------------
+# 几何指纹（版本差异审计）
+# ---------------------------------------------------------------------------
+
+SQUARE_CW = [(0.0, 0.0), (40.0, 0.0), (40.0, 40.0), (0.0, 40.0)]
+SQUARE_CCW = [(0.0, 0.0), (0.0, 40.0), (40.0, 40.0), (40.0, 0.0)]
+
+
+def test_fingerprint_invariant_to_orientation_and_startpoint():
+    rotated = [SQUARE_CW[2], SQUARE_CW[3], SQUARE_CW[0], SQUARE_CW[1]]
+    assert contour_fingerprint(SQUARE_CW, True) \
+        == contour_fingerprint(SQUARE_CCW, True) \
+        == contour_fingerprint(rotated, True)
+
+
+def test_fingerprint_open_path_orientation_invariant():
+    pts = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)]
+    assert contour_fingerprint(pts, False) \
+        == contour_fingerprint(list(reversed(pts)), False)
+    # 开放路径不做循环旋转：换起点视为不同
+    shifted = [(10.0, 0.0), (10.0, 10.0), (0.0, 0.0)]
+    assert contour_fingerprint(pts, False) != contour_fingerprint(shifted, False)
+
+
+def test_fingerprint_distinguishes_closed_vs_open_and_geometry():
+    pts = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)]
+    assert contour_fingerprint(pts, True) != contour_fingerprint(pts, False)
+    other = [(0.0, 0.0), (11.0, 0.0), (11.0, 10.0), (0.0, 10.0)]
+    assert contour_fingerprint(SQUARE_CW, True) \
+        != contour_fingerprint(other, True)
+
+
+def test_fingerprint_quantizes_float_noise():
+    noisy = [(x + 0.00000003, y - 0.00000002) for x, y in SQUARE_CW]
+    assert contour_fingerprint(SQUARE_CW, True) \
+        == contour_fingerprint(noisy, True)
+
+
+def test_fingerprint_on_reversed_and_reordered_real_paths():
+    # 同一几何：外方 + 内孔，仅内孔反向
+    d1 = "M0,0h40v40h-40Z M10,10h20v20h-20Z"
+    d2 = "M0,0h40v40h-40Z M10,30h20v-20h-20Z"
+    r1 = normalize_path(d1, "nonzero")
+    r2 = normalize_path(d2, "nonzero")
+    assert r1["contours"][0]["fingerprint"] == r2["contours"][0]["fingerprint"]
+    assert r1["contours"][1]["fingerprint"] == r2["contours"][1]["fingerprint"]
+    # 子路径重排：指纹集合相同
+    d3 = "M10,10h20v20h-20Z M0,0h40v40h-40Z"
+    r3 = normalize_path(d3, "nonzero")
+    assert ({c["fingerprint"] for c in r1["contours"]}
+            == {c["fingerprint"] for c in r3["contours"]})

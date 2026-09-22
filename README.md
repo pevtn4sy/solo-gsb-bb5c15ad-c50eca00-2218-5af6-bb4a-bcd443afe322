@@ -3,7 +3,8 @@
 基于 **FastAPI + SQLite + Docker** 的服务：接收 SVG `path` 数据与填充规则，
 按轮廓之间的**包含层级**把每个子路径分类为**外环 / 孔洞（可嵌套出“岛”）**，
 并重写绘制方向（外环顺时针、孔洞逆时针），同时保留轮廓层级、原始索引与自定义元数据，
-对边界情况给出明确警告。启动后自动建表，可直接调用。
+对边界情况给出明确警告；另提供 **`POST /paths/compare` 版本差异审计**，按几何指纹
+稳定匹配两条已存路径并给出 added / removed / modified 三组差异。启动后自动建表，可直接调用。
 
 ## 目录结构
 
@@ -13,8 +14,9 @@
 │   ├── __init__.py
 │   ├── main.py        # FastAPI 路由、模型、启动自动初始化
 │   ├── db.py          # SQLite 连接与幂等建表
-│   └── svggeo.py      # SVG path 解析 / 细分 / 包含层级 / 方向重写（零三方依赖）
-├── tests/             # pytest 单元 + API 端到端测试（28 个）
+│   ├── svggeo.py      # SVG path 解析 / 细分 / 包含层级 / 方向重写 / 几何指纹（零三方依赖）
+│   └── diff.py        # 版本差异审计：指纹+索引稳定匹配、三类 modified 分类
+├── tests/             # pytest 单元 + API 端到端测试（50 个）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -104,7 +106,8 @@ curl -s -X POST localhost:8000/paths/1/normalize
 | `depth` | 嵌套深度，0 为最外层；开放/退化轮廓为 `null` |
 | `parent_original_index` | 直接父轮廓的原始索引（顶层为 `null`） |
 | `closed` | 原始子路径是否以 `Z` 闭合 |
-| `signed_area` | 细分折线的有符号面积 |
+| `fingerprint` | 轮廓几何指纹（sha256），与起点、绘制方向无关，供版本匹配 |
+| `signed_area` | 细分折线的有符号面积（**原始方向**，未重写前的符号） |
 | `bounds` | `minx/miny/maxx/maxy` 包围盒 |
 | `reversed` | 本次是否重写了方向 |
 | `metadata` | 创建时按索引提交的自定义元数据 |
@@ -116,6 +119,115 @@ curl -s -X POST localhost:8000/paths/1/normalize
 
 ```bash
 curl -s localhost:8000/paths/1
+```
+
+### `POST /paths/compare` — 两条已存路径的版本差异审计
+
+对 `base_id`（基线）与 `candidate_id`（新版本）两条**已存**路径分别即时规范化
+（审计为只读操作：无需事先调用 normalize，也不会写库），再按**轮廓几何指纹**建立
+稳定匹配：
+
+- 指纹对**绘制起点与顺/逆时针不敏感**（坐标量化到 1e-6 后做循环旋转 + 反向归一），
+  且含闭合标志与绝对坐标，因此同一几何被**重排子路径顺序**、仅改变方向时仍被识别为
+  同一轮廓——**相同指纹但 `original_index` 变化不算差异**；
+- 同指纹轮廓先按相同 `original_index` 配对，剩余项（如多个全等重复轮廓）按索引就近
+  稳定一对一配对；
+- 指纹匹配不上的轮廓退而按相同 `original_index` 配对（作为几何变化），
+  再配不上的计入 `added` / `removed`。
+
+`modified` 的 `change_type`（优先级从高到低）：
+
+| change_type | 含义 |
+|-------------|------|
+| `geometry` | 几何指纹不同（形状/坐标变化；开放折线闭合等也归此类） |
+| `hierarchy` | 几何相同，但 `role`（outer/hole/…）或 `depth` 发生变化 |
+| `orientation` | 几何与层级均相同，仅原始绕向相反（有符号面积符号翻转） |
+
+任一路径不存在返回 `404`；参数非法（id 缺失/非正整数）或已存路径无法规范化
+返回 `422`。
+
+```bash
+curl -s -X POST localhost:8000/paths/compare \
+  -H 'Content-Type: application/json' \
+  -d '{"base_id": 1, "candidate_id": 2}'
+```
+
+响应：
+
+```json
+{
+  "base_id": 1,
+  "candidate_id": 2,
+  "added": [
+    {
+      "candidate_original_index": 2,
+      "candidate_role": "hole",
+      "candidate_depth": 1,
+      "candidate_fingerprint": "a5d4b697…",
+      "candidate_metadata": {"name": "新增螺栓孔"}
+    }
+  ],
+  "removed": [
+    {
+      "base_original_index": 1,
+      "base_role": "hole",
+      "base_depth": 1,
+      "base_fingerprint": "…",
+      "base_metadata": {}
+    }
+  ],
+  "modified": [
+    {
+      "change_type": "orientation",
+      "matched_by": "fingerprint",
+      "fingerprint": {"base": "d39a2033…", "candidate": "d39a2033…"},
+      "base": {
+        "original_index": 1, "role": "hole", "depth": 1,
+        "parent_original_index": 0, "closed": true,
+        "reversed": true, "metadata": {"name": "螺栓孔"}
+      },
+      "candidate": {
+        "original_index": 1, "role": "hole", "depth": 1,
+        "parent_original_index": 0, "closed": true,
+        "reversed": false, "metadata": {"name": "螺栓孔"}
+      }
+    }
+  ],
+  "summary": {
+    "base_contour_count": 2,
+    "candidate_contour_count": 3,
+    "added": 1,
+    "removed": 1,
+    "modified": 1,
+    "unchanged": 1
+  }
+}
+```
+
+- `matched_by` 标识配对依据：`fingerprint`（同指纹，含索引变化的同一轮廓）或
+  `index`（指纹不同、仅原始索引相同的几何变化）；
+- `modified` 两侧均携带 `original_index`、`role`、`depth`、
+  `parent_original_index`、`closed`、`reversed` 与 `metadata`；
+- 仅 `metadata` 不同（几何/层级/方向均未变）不计为 `modified`，元数据仍可在配对
+  快照中查看；
+- `added` / `removed` 条目按对应侧 `original_index` 升序，字段以
+  `candidate_` / `base_` 前缀扁平化给出。
+
+典型调用流程（创建两个版本后审计）：
+
+```bash
+curl -s -X POST localhost:8000/paths -H 'Content-Type: application/json' -d '{
+  "d": "M0,0h40v40h-40Z M10,10h20v20h-20Z"
+}'                                   # -> {"id":1, ...}
+
+curl -s -X POST localhost:8000/paths -H 'Content-Type: application/json' -d '{
+  "d": "M0,0h40v40h-40Z M12,12h16v16h-16Z M30,10h5v5h-5Z"
+}'                                   # -> {"id":2, ...}
+
+curl -s -X POST localhost:8000/paths/compare \
+  -H 'Content-Type: application/json' \
+  -d '{"base_id": 1, "candidate_id": 2}'
+# -> added: 1（新小孔）; modified: 1（原孔 geometry，matched_by=index）
 ```
 
 ### `GET /healthz` — 健康探针
@@ -145,11 +257,14 @@ SVG 规范的端点参数化算法。
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 28 passed
+pytest -q          # 50 passed
 ```
 
 覆盖：解析器边界、面积符号、外/孔/岛三层嵌套、同级双孔、曲线与弧反转几何等价性、
-开放与退化轮廓、元数据保留、完整 API 生命周期、404/422、重复规范化幂等等。
+开放与退化轮廓、元数据保留、完整 API 生命周期、404/422、重复规范化幂等；
+几何指纹的起点/方向不变性、闭合区分、量化噪声吸收；版本审计的仅方向变化、
+层级变化、几何变化、子路径重排（同指纹索引变化）、全等重复轮廓就近配对、
+added/removed、元数据透传、未规范化即时审计与脏数据 422 等。
 
 ## 数据存储
 

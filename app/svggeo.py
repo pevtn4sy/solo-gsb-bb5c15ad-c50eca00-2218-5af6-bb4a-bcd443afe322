@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import re
 from dataclasses import dataclass, field
@@ -28,6 +30,7 @@ _COMMANDS = set("MmLlHhVvCcSsQqTtAaZz")
 
 CURVE_FLAT_STEPS = 12          # 贝塞尔细分段数
 _ARC_MAX_SEGMENTS = 128        # 椭圆弧最多细分段数
+FINGERPRINT_DECIMALS = 6       # 几何指纹坐标量化位数
 
 
 class SVGPathError(ValueError):
@@ -394,6 +397,83 @@ def _on_segment(a, b, p, eps) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# 几何指纹：版本差异审计中跨版本稳定地识别“同一轮廓”
+# ---------------------------------------------------------------------------
+
+def contour_fingerprint(points: list[tuple[float, float]],
+                        closed: bool,
+                        decimals: int = FINGERPRINT_DECIMALS) -> str:
+    """轮廓几何指纹（与起点、绘制方向无关）。
+
+    - 坐标量化到 ``decimals`` 位后重新去重，吸收表示层浮点噪声；
+    - 闭合环：环上任意起点等价（循环旋转），顺/逆时针等价（反向），
+      取「反向 × 旋转」四种形态中字典序最小的序列；
+    - 开放路径：无循环等价，仅消除方向（取原序与逆序的较小者）；
+    - 闭合标志参与指纹，同一折线的开放/闭合形态不会互相匹配。
+
+    返回 sha256 十六进制摘要。
+    """
+    seq = _quantize_ring(points, decimals)
+    if closed:
+        # 闭合环：循环旋转 + 反向，四种形态取字典序最小（退化环同样成立）
+        canonical = min(
+            _min_rotation(seq),
+            _min_rotation(list(reversed(seq))),
+        )
+    else:
+        # 开放路径：无循环等价，仅消除方向（取原序与逆序的较小者）
+        canonical = min(seq, list(reversed(seq)))
+    payload = json.dumps(
+        {"closed": closed, "points": canonical},
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _quantize_ring(points: list[tuple[float, float]],
+                   decimals: int) -> list[tuple[float, float]]:
+    """量化取整（去掉 -0.0）并去除量化后连续重复的点。"""
+    q = 10 ** decimals
+    out: list[tuple[float, float]] = []
+    for x, y in points:
+        px = round(math.floor(x * q + 0.5) / q, decimals)
+        py = round(math.floor(y * q + 0.5) / q, decimals)
+        px = px + 0.0  # -0.0 -> 0.0
+        py = py + 0.0
+        if not out or out[-1] != (px, py):
+            out.append((px, py))
+    if len(out) > 1 and out[0] == out[-1]:
+        out.pop()
+    return out
+
+
+def _min_rotation(seq: list) -> list:
+    """Booth 算法：返回字典序最小的循环旋转（O(n)）。"""
+    n = len(seq)
+    if n == 0:
+        return []
+    s = seq + seq
+    i, j, k = 0, 1, 0
+    while i < n and j < n and k < n:
+        a, b = s[i + k], s[j + k]
+        if a == b:
+            k += 1
+        elif a > b:
+            i = i + k + 1
+            if i <= j:
+                i = j + 1
+            k = 0
+        else:
+            j = j + k + 1
+            if j <= i:
+                j = i + 1
+            k = 0
+    start = min(i, j)
+    return s[start:start + n]
+
+
+# ---------------------------------------------------------------------------
 # 方向重写
 # ---------------------------------------------------------------------------
 
@@ -524,6 +604,7 @@ class Contour:
     bounds: tuple[float, float, float, float]
     closed: bool
     degenerate: bool
+    fingerprint: str = ""
     role: str = "unknown"          # outer / hole / open / degenerate
     depth: int = -1
     parent_original_index: int | None = None
@@ -565,6 +646,7 @@ def normalize_path(d: str, fill_rule: str,
             bounds=bounds,
             closed=sub["closed"],
             degenerate=degenerate,
+            fingerprint=contour_fingerprint(pts, sub["closed"]),
             metadata=dict(contour_metadata[idx])
             if contour_metadata and idx < len(contour_metadata) else {},
         ))
@@ -683,6 +765,7 @@ def normalize_path(d: str, fill_rule: str,
             "depth": c.depth if c.depth >= 0 else None,
             "parent_original_index": c.parent_original_index,
             "closed": c.closed,
+            "fingerprint": c.fingerprint,
             "signed_area": c.area,
             "bounds": {"minx": c.bounds[0], "miny": c.bounds[1],
                        "maxx": c.bounds[2], "maxy": c.bounds[3]},
